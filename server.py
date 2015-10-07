@@ -52,7 +52,8 @@ class Room(object):
 
     def add_user(self, user):
         assert isinstance(user, User)
-        user.write('*** {} history\n'.format(self))
+        if self._history:
+            user.write('*** {} history\n'.format(self))
         for message in self._history:
             user.write(message)
         self._users.add(user)
