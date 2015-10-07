@@ -2,6 +2,7 @@
 import signal
 import weakref
 import re
+from collections import deque
 from tornado.ioloop import IOLoop
 from tornado.iostream import StreamClosedError
 from tornado import gen
@@ -11,7 +12,9 @@ from tornado.options import define, options
 import logging
 log = logging.getLogger(__name__)
 
-define('port', default=None, help='chat port', type=int)
+define('port', default=23, help='chat port', type=int)
+
+HISTORY_LENGTH = 10
 
 
 class Cached(type):
@@ -34,10 +37,12 @@ class Room(object):
     def __init__(self, name):
         self._name = name
         self._users = weakref.WeakSet()
+        self._history = deque(maxlen=HISTORY_LENGTH)
         super(Room, self).__init__()
 
     @gen.coroutine
     def write(self, message):
+        self._history.append(message)
         for user in self.users:
             user.write(message)
 
@@ -47,6 +52,9 @@ class Room(object):
 
     def add_user(self, user):
         assert isinstance(user, User)
+        user.write('*** {} history\n'.format(self))
+        for message in self._history:
+            user.write(message)
         self._users.add(user)
 
     def remove_user(self, user):
@@ -57,28 +65,21 @@ class Room(object):
     def is_empty(self):
         return not bool(self.users)
 
-    def __repr__(self):
-        return 'Room("{}") {} {}'.format(self._name, list(self.users))
-
     def __str__(self):
-        return '{}'.format(self._name)
-
-    # def __del__(self):
-    #     print self, id(self), 'Die'
-    #     pass
+        return '#{}'.format(self._name)
 
 
 class User(object):
     def __init__(self, stream, nick=None):
         self._stream = stream
         self._nick = nick if nick else 'anonymous'
-
         self._rooms = weakref.WeakSet()
         super(User, self).__init__()
 
     @gen.coroutine
     def write(self, message):
-        yield self._stream.write(message)
+        if not self._stream.closed():
+            yield self._stream.write(message)
 
     @property
     def nick(self):
@@ -92,6 +93,10 @@ class User(object):
     def rooms(self):
         return self._rooms
 
+    @property
+    def stream(self):
+        return self._stream
+
     def add_room(self, room):
         assert isinstance(room, Room)
         self._rooms.add(room)
@@ -100,8 +105,8 @@ class User(object):
         assert isinstance(room, Room)
         self._rooms -= set([room])
 
-    def __repr__(self):
-        return 'User("{}")'.format(self._nick)
+    def __str__(self):
+        return '{}'.format(self._nick)
 
 
 class Server(TCPServer):
@@ -112,11 +117,8 @@ class Server(TCPServer):
 
     @gen.coroutine
     def handle_stream(self, stream, address):
-        log.info("New connection. %s", stream)
-
         user = User(stream)
         self.__all_users.add(user)
-        print 'add user', list(self.__all_users)
 
         while True:
             try:
@@ -124,66 +126,74 @@ class Server(TCPServer):
                 match = self.pattern.match(message)
                 if match:
                     cmd, param = match.groups()
-                    func = getattr(self, cmd.lower())
+                    func = getattr(self, 'handle_' + cmd.lower())
                     if func and callable(func):
-                        func(user, param)
+                        yield func(user, param)
                     else:
                         raise NotImplementedError
                 else:
-                    yield self.broadcast(user, message)
+                    yield self.send(user, message)
 
             except StreamClosedError:
-                log.info("%s left.", user)
+                log.info("%s disconnect.", user)
                 break
 
-        print 'remove user', list(self.__all_users)
-        self.__all_users.remove(user)
+        yield self.broadcast("*** User {} leave chat".format(user))
         for room in user.rooms:
-            self.left(user, room)
+            yield self.handle_left(user, room)
+        self.__all_users.remove(user)
 
     @gen.coroutine
-    def broadcast(self, user, message):
-        for room in user.rooms:
-            yield room.write(
-                "{}:{}> {}".format(room, user.nick, message)
-            )
-
-    def join(self, user, room_name):
+    def handle_join(self, user, room_name):
         room = Room(room_name)
         self.__all_rooms.add(room)
         user.add_room(room)
         room.add_user(user)
+        yield self.broadcast("User {} joined room {}".format(user, room))
 
-    def left(self, user, room_name):
+    @gen.coroutine
+    def handle_left(self, user, room_name):
         room = Room(room_name)
         user.remove_room(room)
         room.remove_user(user)
         if room.is_empty():
             self.__all_rooms -= set([room])
+        yield self.broadcast("User {} lefted room {}".format(user, room))
 
-    def login(self, user, nick):
+    @gen.coroutine
+    def handle_login(self, user, nick):
+        yield self.broadcast("User change nick {} --> {}".format(user.nick,
+                                                                 nick))
         user.nick = nick
 
+    @gen.coroutine
+    def send(self, user, message):
+        for room in user.rooms:
+            yield room.write(
+                "{}:{}> {}".format(room, user.nick, message)
+            )
 
-    # @classmethod
-    # def shutdown(self):
-    #     for client in Server.__clients:
-    #         if not client.closed():
-    #             client.close()
-    #         Server.__clients.remove(client)
+    @gen.coroutine
+    def broadcast(self, message):
+        for user in self.__all_users:
+            yield user.write("*** {}\n".format(message))
+
+    @classmethod
+    def shutdown(cls):
+        for user in cls.__all_users:
+            user.write("*** have a nice day ***\n")
+            if not user.stream.closed():
+                user.stream.close()
 
 if __name__ == "__main__":
-    server = Server()
     options.parse_command_line()
-    port = options.port or int(raw_input("enter port (8080): ") or 8080)
 
-    ioloop = IOLoop.instance()
-    server.listen(port)
+    server = Server()
+    server.listen(options.port)
 
-    def shutdown():
-        # server.shutdown()
-        ioloop.stop()
+    def shutdown(sig, frame):
+        server.shutdown()
+        IOLoop.instance().stop()
 
-    signal.signal(signal.SIGINT, lambda sig, frame: shutdown())
-
-    ioloop.start()
+    signal.signal(signal.SIGINT, shutdown)
+    ioloop = IOLoop.instance().start()
